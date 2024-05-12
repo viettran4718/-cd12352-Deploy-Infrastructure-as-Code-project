@@ -1,18 +1,186 @@
-Description: CD12352 - Infrastructure as Code Project - Udagram
+Description: This CloudFormation template facilitates the setup of the Udagram Project 2 server infrastructure, streamlining the deployment process.
 
 Parameters:
-  # Add your parameters here
+    EnvironmentName:
+        Description: Name prefix for all resources within this environment.
+        Type: String
+    ServerAMIId:
+        Description: ID of the AMI for EC2 instances.
+        Type: String
+        Default: ami-0e001c9271cf7f3b9
+    InstanceType:
+        Description: Type of EC2 instance.
+        Type: String
+        Default: t2.micro
 
 Resources:
-  # Add your resources here
-  # We include a portion of the LaunchTemplate resource so you can use the UserData.
-  WebAppLaunchTemplate:
-    Type: AWS::EC2::LaunchTemplate
-    Properties: 
-      LaunchTemplateData:
-        UserData:
-          Fn::Base64: |
-            #!/bin/bash
-            apt-get update -y
-            sudo apt-get install nginx -y
-            service nginx start
+    # Security Group for Load Balancer
+    LBSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupDescription: Allows HTTP requests load balancer
+            VpcId:
+                Fn::ImportValue: 
+                    !Sub "${EnvironmentName}-VPCID"
+            SecurityGroupIngress:
+                - IpProtocol: tcp
+                  FromPort: 80
+                  ToPort: 80
+                  CidrIp: 0.0.0.0/0
+            SecurityGroupEgress:
+                - IpProtocol: tcp
+                  FromPort: 80
+                  ToPort: 80
+                  CidrIp: 0.0.0.0/0
+
+    # Security group for Web server
+    WebServerSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupDescription: Allows HTTP and SSH access
+            VpcId:
+                Fn::ImportValue: 
+                    !Sub "${EnvironmentName}-VPCID"
+            SecurityGroupIngress:
+                - IpProtocol: tcp
+                  FromPort: 80
+                  ToPort: 80
+                  SourceSecurityGroupId: !Ref LBSecurityGroup
+            SecurityGroupEgress: 
+                - IpProtocol: tcp
+                  FromPort: 0
+                  ToPort: 65535
+                  CidrIp: 0.0.0.0/0
+
+    # IAM role allowing EC2 to access S3.
+    EC2Policy:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service:
+                              - ec2.amazonaws.com
+                      Action:
+                          - sts:AssumeRole
+            Path: "/"
+
+    # S3 Bucket Instance Profile Management 
+    InstanceProfileRole:
+        Type: AWS::IAM::InstanceProfile
+        Properties:
+            Path: "/"
+            Roles:
+                - Ref: EC2Policy
+
+    # S3 Bucket Policy Management
+    S3RolePolices:
+        Type: AWS::IAM::Policy
+        Properties:
+            PolicyName: S3BucketsPolicy
+            PolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    - Effect: Allow
+                      Action:
+                          -   s3:*
+                      Resource: "*"
+            Roles:
+                - Ref: EC2Policy
+
+    # Launch configuration for EC2 instances.
+    WebServerLaunchTemplate:
+        Type: AWS::EC2::LaunchTemplate
+        Properties:
+            LaunchTemplateName: WebServerLaunchTemplate
+            LaunchTemplateData:
+                UserData:
+                    Fn::Base64: !Sub |
+                        #!/bin/bash
+                        apt-get update -y
+                        sudo apt-get install apache2 -y
+                        systemectl start apache2.service
+                        cd /var/www/html
+                        echo "“it works! Udagram, Udacity. This is demo page of VietTQ"> index.html
+                ImageId: !Ref ServerAMIId
+                IamInstanceProfile: 
+                    Name: !Ref InstanceProfileRole
+                SecurityGroupIds:
+                    - !Ref WebServerSecurityGroup
+                InstanceType: !Ref InstanceType
+                BlockDeviceMappings:
+                    - DeviceName: /dev/sda1
+                      Ebs:
+                        VolumeSize: '10'
+                        VolumeType: 'gp2'
+
+    WebServerGroup:
+        Type: AWS::AutoScaling::AutoScalingGroup
+        Properties:
+            VPCZoneIdentifier:
+                - Fn::ImportValue: !Sub "${EnvironmentName}-PRIV-SUBS"
+            LaunchTemplate:
+                LaunchTemplateId: !Ref WebServerLaunchTemplate
+                Version: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+            MinSize: '4'
+            MaxSize: '4'
+            TargetGroupARNs:
+                - !Ref WebServerTargetGroup
+
+    WebServerLB:
+        Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+        Properties:
+            Subnets:
+                - Fn::ImportValue: !Sub "${EnvironmentName}-PUB-SUB1"
+                - Fn::ImportValue: !Sub "${EnvironmentName}-PUB-SUB2"
+            SecurityGroups:
+                - Ref: LBSecurityGroup
+
+    # Load Balancer Listener
+    Listener:
+        Type: AWS::ElasticLoadBalancingV2::Listener
+        Properties:
+            DefaultActions:
+                - Type: forward
+                  TargetGroupArn:
+                      Ref: WebServerTargetGroup
+            LoadBalancerArn:
+                Ref: WebServerLB
+            Port: "80"
+            Protocol: HTTP
+
+    ALBListenerRule:
+        Type: AWS::ElasticLoadBalancingV2::ListenerRule
+        Properties:
+            Actions:
+                - Type: forward
+                  TargetGroupArn: !Ref "WebServerTargetGroup"
+            Conditions:
+                - Field: path-pattern
+                  Values: [/]
+            ListenerArn: !Ref "Listener"
+            Priority: 1
+
+    WebServerTargetGroup:
+        Type: AWS::ElasticLoadBalancingV2::TargetGroup
+        Properties:
+            HealthCheckIntervalSeconds: 6
+            HealthCheckPath: /
+            HealthCheckProtocol: HTTP
+            HealthCheckTimeoutSeconds: 5
+            HealthyThresholdCount: 3
+            Port: 80
+            Protocol: HTTP
+            UnhealthyThresholdCount: 3
+            VpcId:
+                Fn::ImportValue:
+                    Fn::Sub: "${EnvironmentName}-VPCID"
+
+Outputs:
+    WebServerLBEndpoint:
+        Description: Endpoint to Web Server LB
+        Value: !Join ["", ["http://", !GetAtt WebServerLB.DNSName]]
+        Export:
+            Name: !Sub ${EnvironmentName}-LB-DNSName
